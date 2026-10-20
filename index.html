@@ -59,12 +59,18 @@
   .show { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--en); margin-top: 8px; }
   .show input { width: auto; height: auto; }
   #cancel { background: var(--line); color: var(--ko); }
+  #ver { background: none; border: 0; color: var(--muted); font-size: 12px; padding: 4px; }
+  #debug { display: none; max-height: 30vh; overflow-y: auto; margin: 0 16px 8px; padding: 8px 10px;
+    background: #000; color: #8bd17c; font: 11px/1.45 ui-monospace, Menlo, monospace;
+    border-radius: 8px; white-space: pre-wrap; word-break: break-all; }
+  #debug.on { display: block; }
 </style>
 </head>
 <body>
 <header>
   <span id="dot" class="dot"></span>
   <h1>영어 → 한국어 실시간 통역</h1>
+  <button id="ver" aria-label="진단 기록 보기"></button>
   <button id="settingsBtn" aria-label="설정">설정</button>
 </header>
 
@@ -72,6 +78,7 @@
   <div id="empty">아래 <b>시작</b> 버튼을 누르고<br>상대방의 영어를 들려주세요.</div>
 </main>
 <div id="interim"></div>
+<pre id="debug"></pre>
 
 <footer>
   <button id="clearBtn" class="ghost">지우기</button>
@@ -111,6 +118,27 @@ const SYSTEM = `You are a live interpreter for a Korean business traveler in the
 Translate the latest English utterance into natural, spoken Korean.
 The text comes from speech recognition, so it may have missing punctuation or misheard words; infer the intended meaning from context.
 Use the earlier utterances only as context. Output only the Korean translation of the latest utterance, with no notes, quotes, or romanization.`;
+
+const APP_VERSION = "v4";
+const session = {
+  get(k, d = "") { try { return sessionStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
+  del(k) { try { sessionStorage.removeItem(k); } catch {} },
+};
+
+// ---------- diagnostics (tap the version label to show) ----------
+const debugLines = JSON.parse(session.get("debug", "[]"));
+function dbg(msg) {
+  const t = new Date().toTimeString().slice(0, 8);
+  debugLines.push(`${t} ${msg}`);
+  if (debugLines.length > 60) debugLines.shift();
+  session.set("debug", JSON.stringify(debugLines));
+  $("debug").textContent = debugLines.join("\n");
+  $("debug").scrollTop = $("debug").scrollHeight;
+}
+$("ver").textContent = APP_VERSION;
+$("ver").onclick = () => $("debug").classList.toggle("on");
+$("debug").textContent = debugLines.join("\n");
 
 let recognition = null;
 let running = false;
@@ -171,10 +199,14 @@ function addItem(english) {
   el.scrollIntoView({ behavior: "smooth", block: "end" });
   return el.querySelector(".ko");
 }
+function saveLog() { session.set("log", $("log").innerHTML); }
 $("clearBtn").onclick = () => {
   $("log").innerHTML = "";
   history.length = 0;
+  saveLog();
+  dbg("clear");
 };
+if (session.get("log")) $("log").innerHTML = session.get("log");
 
 // ---------- translation ----------
 async function translate(english) {
@@ -183,6 +215,7 @@ async function translate(english) {
   if (!apiKey) {
     koEl.className = "ko err";
     koEl.textContent = "설정에서 API 키를 먼저 입력하세요.";
+    saveLog();
     return;
   }
   const context = history.slice(-4);
@@ -226,10 +259,23 @@ async function translate(english) {
     else if (e instanceof Anthropic.APIConnectionError) koEl.textContent = "인터넷 연결을 확인하세요.";
     else koEl.textContent = "번역 오류: " + (e.message || e);
   }
+  saveLog();
 }
 
 // ---------- speech recognition ----------
+// iOS Safari's recognizer is fragile: reusing or restarting it too soon can leave it "running"
+// while it hears nothing. So every session gets a brand-new recognizer, the old one is fully
+// detached, a short gap is kept between sessions, and a watchdog reloads the page (keeping the
+// transcript) if a new session never comes alive.
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const GAP_MS = 700;      // quiet time between one session ending and the next starting
+const ALIVE_MS = 3000;   // how long a new session may take to report audio
+let lastTeardown = 0;
+let watchdog = null;
+let startTimer = null;
+let doneText = {};       // per result index: the text already translated
+let lastInterim = [];    // [{i, text}] from the latest event, for the silence flush
+let silenceTimer = null;
 
 function setRunning(on) {
   running = on;
@@ -245,14 +291,6 @@ async function keepScreenOn(on) {
     else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
   } catch {}
 }
-
-// iOS Safari is fragile here: a new recognizer started while the previous one is still
-// shutting down silently gets no audio, and finals sometimes never arrive. So we keep one
-// recognizer, only call start() after it has fully ended, and also finalize on silence.
-let recActive = false;  // recognizer is currently running (between onstart and onend)
-let doneText = {};      // per result index: the text already translated
-let lastInterim = [];   // [{i, text}] from the latest event, for the silence flush
-let silenceTimer = null;
 
 // Part of `text` not yet translated. iOS may grow one result in place (new words appended)
 // or reuse the index for a new sentence; only strip the old text when it is a real prefix.
@@ -274,25 +312,48 @@ function flushInterim() {
   $("interim").textContent = "";
 }
 
-function ensureRecognizer() {
-  if (recognition) return recognition;
-  recognition = new SR();
-  recognition.lang = "en-US";
-  recognition.continuous = true;
-  recognition.interimResults = true;
+function teardown() {
+  clearTimeout(watchdog);
+  watchdog = null;
+  clearTimeout(silenceTimer);
+  flushInterim();
+  if (!recognition) return;
+  const old = recognition;
+  recognition = null;
+  for (const k of ["onstart", "onaudiostart", "onresult", "onerror", "onend"]) old[k] = null;
+  try { old.abort(); } catch {}
+  lastTeardown = Date.now();
+}
 
-  recognition.onstart = () => {
-    recActive = true;
-    doneText = {};
-    lastInterim = [];
-  };
-  recognition.onresult = (e) => {
+function alive(why) {
+  if (watchdog) { clearTimeout(watchdog); watchdog = null; dbg("alive: " + why); }
+  session.del("recovered"); // working again, so a later stall may reload once more
+}
+
+function newSession() {
+  clearTimeout(startTimer);
+  if (!running) return;
+  const wait = lastTeardown + GAP_MS - Date.now();
+  if (wait > 0) { startTimer = setTimeout(newSession, wait); return; }
+
+  const rec = new SR();
+  recognition = rec;
+  rec.lang = "en-US";
+  rec.continuous = true;
+  rec.interimResults = true;
+  doneText = {};
+  lastInterim = [];
+
+  rec.onstart = () => { dbg("onstart"); if (!("onaudiostart" in rec)) alive("start"); };
+  rec.onaudiostart = () => alive("audio");
+  rec.onresult = (e) => {
+    alive("result");
     const shown = [];
     lastInterim = [];
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const r = e.results[i];
       const text = r[0].transcript;
-      if (r.isFinal) flush(i, text);
+      if (r.isFinal) { dbg(`final[${i}] ${text.slice(0, 40)}`); flush(i, text); }
       else {
         lastInterim.push({ i, text });
         shown.push(untranslated(i, text));
@@ -302,32 +363,46 @@ function ensureRecognizer() {
     clearTimeout(silenceTimer);
     if (lastInterim.length) silenceTimer = setTimeout(flushInterim, 1500);
   };
-  recognition.onerror = (e) => {
+  rec.onerror = (e) => {
+    dbg("error: " + e.error);
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
       alert("마이크 또는 음성 인식 권한이 꺼져 있습니다.\n설정 > Safari > 마이크, 그리고 설정 > 일반 > 키보드에서 '받아쓰기'를 켜주세요.");
       stop();
-    } else if (e.error !== "no-speech" && e.error !== "aborted") {
-      $("interim").textContent = "음성 인식 오류: " + e.error + " (자동으로 다시 시도합니다)";
     }
   };
-  recognition.onend = () => {
-    recActive = false;
-    clearTimeout(silenceTimer);
-    flushInterim();
-    // iOS ends recognition after pauses; restart while the user wants it running.
-    if (running) setTimeout(safeStart, 300);
+  rec.onend = () => {
+    dbg("onend");
+    teardown();
+    // iOS ends sessions after pauses; open a fresh one while the user wants it running.
+    if (running) newSession();
   };
-  return recognition;
+
+  watchdog = setTimeout(recover, ALIVE_MS);
+  try {
+    rec.start();
+    dbg("start()");
+  } catch (e) {
+    dbg("start() failed: " + e.message);
+    teardown();
+    startTimer = setTimeout(newSession, GAP_MS);
+  }
 }
 
-function safeStart() {
-  if (!running || recActive) return; // if still ending, onend will call us again
-  try {
-    ensureRecognizer().start();
-  } catch (e) {
-    // InvalidStateError: the previous session has not fully released yet.
-    setTimeout(safeStart, 500);
+// The recognizer never came alive: iOS sometimes only recovers after a page reload.
+function recover() {
+  watchdog = null;
+  if (!running) return;
+  if (session.get("recovered")) {
+    dbg("no audio again after reload; giving up");
+    stop();
+    $("interim").textContent = "음성 인식이 응답하지 않습니다. 앱을 완전히 닫았다가 다시 열어주세요.";
+    return;
   }
+  dbg("no audio in 3s -> reload");
+  session.set("recovered", "1");
+  session.set("resume", "1");
+  saveLog();
+  location.reload();
 }
 
 function start() {
@@ -336,18 +411,18 @@ function start() {
     return;
   }
   if (!store.get("apiKey")) { openSettings(); return; }
+  dbg("tap start");
   setRunning(true);
   keepScreenOn(true);
-  // Still shutting down from the last stop: abort to hurry it; onend then restarts.
-  if (recActive) recognition.abort();
-  else safeStart();
+  newSession();
 }
 
 function stop() {
+  dbg("stop");
   setRunning(false);
   keepScreenOn(false);
-  clearTimeout(silenceTimer);
-  if (recognition && recActive) recognition.stop(); // onend flushes the last words
+  clearTimeout(startTimer);
+  teardown();
 }
 
 $("toggleBtn").onclick = () => (running ? stop() : start());
@@ -356,7 +431,15 @@ document.addEventListener("visibilitychange", () => {
 });
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+dbg(`loaded ${APP_VERSION}`);
 if (!store.get("apiKey")) openSettings();
+else if (session.get("resume")) {
+  // Coming back from a recovery reload: try to continue without another tap.
+  session.del("resume");
+  start();
+} else {
+  session.del("recovered");
+}
 </script>
 </body>
 </html>
