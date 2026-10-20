@@ -34,6 +34,8 @@
   .item .ko.wait { color: var(--muted); font-weight: 400; font-size: 18px; }
   .item .ko.err { color: var(--live); font-size: 16px; font-weight: 400; }
   .item .en { margin-top: 8px; font-size: 15px; line-height: 1.4; color: var(--en); }
+  .item.rev { border-left: 4px solid var(--accent); }
+  .item.rev .ko { font-size: 28px; word-break: normal; }
   #interim { min-height: 52px; padding: 12px 16px; color: var(--en); font-size: 16px;
     border-top: 1px solid var(--line); font-style: italic; }
   #empty { color: var(--muted); text-align: center; margin: auto; font-size: 16px; line-height: 1.7; }
@@ -42,6 +44,7 @@
     font-weight: 600; color: #fff; background: var(--accent); }
   footer button.stop { background: var(--live); }
   footer button.ghost { flex: 0 0 90px; background: var(--card); color: var(--en); }
+  footer #revBtn { flex: 0 0 64px; font-size: 24px; color: var(--ko); }
   dialog { background: var(--card); color: var(--ko); border: 1px solid var(--line);
     border-radius: 16px; padding: 20px; width: min(92vw, 420px); margin: auto; }
   dialog::backdrop { background: rgba(0,0,0,.6); }
@@ -69,19 +72,20 @@
 <body>
 <header>
   <span id="dot" class="dot"></span>
-  <h1>영어 → 한국어 실시간 통역</h1>
+  <h1 id="title">영어 → 한국어 실시간 통역</h1>
   <button id="ver" aria-label="진단 기록 보기"></button>
   <button id="settingsBtn" aria-label="설정">설정</button>
 </header>
 
 <main id="log">
-  <div id="empty">아래 <b>시작</b> 버튼을 누르고<br>상대방의 영어를 들려주세요.</div>
+  <div id="empty">아래 <b>시작</b> 버튼을 누르고<br><span id="emptyHint">상대방의 영어를</span> 들려주세요.<br><small>⇄ 버튼으로 통역 방향을 바꿀 수 있습니다.</small></div>
 </main>
 <div id="interim"></div>
 <pre id="debug"></pre>
 
 <footer>
   <button id="clearBtn" class="ghost">지우기</button>
+  <button id="revBtn" class="ghost" aria-label="통역 방향 바꾸기">⇄</button>
   <button id="toggleBtn">시작</button>
 </footer>
 
@@ -114,12 +118,26 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
 };
 
-const SYSTEM = `You are a live interpreter for a Korean business traveler in the US.
-Translate the latest English utterance into natural, spoken Korean.
+const SYSTEM = `You are a live interpreter in a conversation between a Korean business traveler ("Me", speaks Korean) and people in the US ("Them", speak English).
+Translate the latest utterance into the requested language, in natural spoken style: polite, clear business English, or natural Korean.
 The text comes from speech recognition, so it may have missing punctuation or misheard words; infer the intended meaning from context.
-Use the earlier utterances only as context. Output only the Korean translation of the latest utterance, with no notes, quotes, or romanization.`;
+Use the earlier utterances only as context. Output only the translation of the latest utterance, with no notes, quotes, or romanization.`;
 
-const APP_VERSION = "v5";
+// Translation direction. The recognizer listens in one language per page load (see below),
+// so switching direction reloads the page.
+const DIRS = {
+  "en-ko": { lang: "en-US", from: "English", to: "Korean", who: "Them",
+             title: "영어 → 한국어 실시간 통역", hint: "상대방의 영어를" },
+  "ko-en": { lang: "ko-KR", from: "Korean", to: "English", who: "Me",
+             title: "한국어 → 영어 실시간 통역", hint: "내 한국어를" },
+};
+const dir = DIRS[store.get("dir", "en-ko")] ? store.get("dir", "en-ko") : "en-ko";
+const D = DIRS[dir];
+$("title").textContent = D.title;
+if ($("emptyHint")) $("emptyHint").textContent = D.hint;
+let pending = 0; // translations still streaming
+
+const APP_VERSION = "v6";
 const session = {
   get(k, d = "") { try { return sessionStorage.getItem(k) ?? d; } catch { return d; } },
   set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
@@ -192,7 +210,7 @@ $("save").onclick = () => {
 function addItem(english) {
   $("empty")?.remove();
   const el = document.createElement("div");
-  el.className = "item";
+  el.className = dir === "ko-en" ? "item rev" : "item";
   el.innerHTML = `<div class="ko wait">번역 중…</div><div class="en"></div>`;
   el.querySelector(".en").textContent = english;
   $("log").appendChild(el);
@@ -201,7 +219,7 @@ function addItem(english) {
 }
 function saveLog() {
   session.set("log", $("log").innerHTML);
-  session.set("history", JSON.stringify(history.slice(-4)));
+  session.set("history", JSON.stringify(history.slice(-6)));
 }
 $("clearBtn").onclick = () => {
   $("log").innerHTML = "";
@@ -222,12 +240,13 @@ async function translate(english) {
     saveLog();
     return;
   }
-  const context = history.slice(-4);
-  history.push(english);
+  const context = history.slice(-6);
+  history.push(`${D.who} (${D.from}): ${english}`);
 
-  const prompt = (context.length ? `Earlier utterances:\n${context.map((t) => "- " + t).join("\n")}\n\n` : "")
-    + `Latest utterance:\n${english}`;
+  const prompt = (context.length ? `Earlier conversation:\n${context.map((t) => "- " + t).join("\n")}\n\n` : "")
+    + `Translate this latest ${D.from} utterance into ${D.to}:\n${english}`;
 
+  pending++;
   try {
     const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
     const model = store.get("model", "claude-opus-5-5");
@@ -263,6 +282,7 @@ async function translate(english) {
     else if (e instanceof Anthropic.APIConnectionError) koEl.textContent = "인터넷 연결을 확인하세요.";
     else koEl.textContent = "번역 오류: " + (e.message || e);
   }
+  pending--;
   saveLog();
 }
 
@@ -318,8 +338,12 @@ function flushInterim() {
   $("interim").textContent = "";
 }
 
-function reloadAndResume(why) {
+async function reloadAndResume(why) {
   dbg("reload: " + why);
+  $("interim").textContent = "전환 중…";
+  // Let translations that are still streaming finish so the reload does not cut them off.
+  const until = Date.now() + 8000;
+  while (pending > 0 && Date.now() < until) await new Promise((r) => setTimeout(r, 200));
   session.set("resume", "1");
   saveLog();
   location.reload();
@@ -329,7 +353,7 @@ function createRecognizer() {
   used = true;
   const rec = new SR();
   recognition = rec;
-  rec.lang = "en-US";
+  rec.lang = D.lang;
   rec.continuous = true;
   rec.interimResults = true;
 
@@ -443,6 +467,17 @@ function stop() {
 }
 
 $("toggleBtn").onclick = () => (running ? stop() : start());
+$("revBtn").onclick = () => {
+  const next = dir === "en-ko" ? "ko-en" : "en-ko";
+  dbg("reverse -> " + next);
+  store.set("dir", next);
+  if (running) flushInterim(); // translate what was said just before switching
+  // Always reload: the recognizer's language is fixed for the page, and reusing it is unsafe.
+  // The reload resumes listening right away in the new language.
+  reloadAndResume("direction " + next);
+};
+// Release the microphone when the page goes away, so the reloaded page can take it cleanly.
+window.addEventListener("pagehide", () => { try { recognition?.abort(); } catch {} });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && running) keepScreenOn(true);
 });
