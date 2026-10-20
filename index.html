@@ -53,6 +53,11 @@
   dialog .row { display: flex; gap: 10px; margin-top: 18px; }
   dialog .row button { flex: 1; height: 46px; border-radius: 10px; border: 0; font-size: 16px; font-weight: 600; }
   #save { background: var(--accent); color: #fff; }
+  #check { background: var(--line); color: var(--ko); }
+  #keyStatus { min-height: 20px; font-size: 14px; margin-top: 10px; line-height: 1.5; word-break: break-all; }
+  #keyStatus.ok { color: #34d399; } #keyStatus.bad { color: var(--live); }
+  .show { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--en); margin-top: 8px; }
+  .show input { width: auto; height: auto; }
   #cancel { background: var(--line); color: var(--ko); }
 </style>
 </head>
@@ -76,7 +81,9 @@
 <dialog id="settings">
   <h2>설정</h2>
   <label for="apiKey">Anthropic API 키</label>
-  <input id="apiKey" type="password" autocomplete="off" placeholder="sk-ant-...">
+  <input id="apiKey" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="sk-ant-api03-...">
+  <label class="show"><input id="showKey" type="checkbox"> 키 보기</label>
+  <div id="keyStatus"></div>
   <p>키는 이 아이폰 안에만 저장되고, 번역 요청 때 Anthropic 서버로만 전송됩니다.</p>
   <label for="model">번역 모델</label>
   <select id="model">
@@ -86,6 +93,7 @@
   </select>
   <div class="row">
     <button id="cancel">닫기</button>
+    <button id="check">키 확인</button>
     <button id="save">저장</button>
   </div>
 </dialog>
@@ -112,13 +120,42 @@ const history = []; // recent English utterances for context
 // ---------- settings ----------
 function openSettings() {
   $("apiKey").value = store.get("apiKey");
+  $("keyStatus").textContent = "";
   $("model").value = store.get("model", "claude-opus-5-5");
   $("settings").showModal();
 }
 $("settingsBtn").onclick = openSettings;
 $("cancel").onclick = () => $("settings").close();
+// Pasted keys often carry spaces, line breaks, invisible characters or "smart" dashes.
+function cleanKey(raw) {
+  return raw.replace(/[\s\u200B-\u200D\uFEFF]/g, "").replace(/[\u2010-\u2015\u2212]/g, "-");
+}
+$("showKey").onchange = (e) => { $("apiKey").type = e.target.checked ? "text" : "password"; };
+$("check").onclick = async () => {
+  const key = cleanKey($("apiKey").value);
+  $("apiKey").value = key;
+  const st = $("keyStatus");
+  if (!key.startsWith("sk-ant-")) {
+    st.className = "bad";
+    st.textContent = `키는 "sk-ant-"로 시작해야 합니다. 지금 입력된 값은 "${key.slice(0, 10)}…" 입니다.`;
+    return;
+  }
+  st.className = ""; st.textContent = "확인 중…";
+  try {
+    // Listing models costs nothing and only succeeds with a valid key.
+    await new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true }).models.list({ limit: 1 });
+    store.set("apiKey", key);
+    st.className = "ok";
+    st.textContent = "✓ 정상적인 키입니다. 저장했습니다.";
+  } catch (e) {
+    st.className = "bad";
+    st.textContent = (e instanceof Anthropic.AuthenticationError)
+      ? `Anthropic이 이 키를 거부했습니다 (길이 ${key.length}자, 끝 4자리 …${key.slice(-4)}). 콘솔에서 키가 삭제·비활성화되지 않았는지 확인하거나 새 키를 만들어 붙여넣으세요.`
+      : "확인 실패: " + (e.message || e);
+  }
+};
 $("save").onclick = () => {
-  store.set("apiKey", $("apiKey").value.trim());
+  store.set("apiKey", cleanKey($("apiKey").value));
   store.set("model", $("model").value);
   $("settings").close();
 };
@@ -184,6 +221,7 @@ async function translate(english) {
   } catch (e) {
     koEl.className = "ko err";
     if (e instanceof Anthropic.AuthenticationError) koEl.textContent = "API 키가 올바르지 않습니다. 설정을 확인하세요.";
+    else if (e instanceof Anthropic.BadRequestError && /credit balance/i.test(e.message)) koEl.textContent = "API 크레딧이 부족합니다. console.anthropic.com에서 충전하세요.";
     else if (e instanceof Anthropic.RateLimitError) koEl.textContent = "요청이 너무 많습니다. 잠시 후 다시 시도하세요.";
     else if (e instanceof Anthropic.APIConnectionError) koEl.textContent = "인터넷 연결을 확인하세요.";
     else koEl.textContent = "번역 오류: " + (e.message || e);
@@ -208,52 +246,108 @@ async function keepScreenOn(on) {
   } catch {}
 }
 
+// iOS Safari is fragile here: a new recognizer started while the previous one is still
+// shutting down silently gets no audio, and finals sometimes never arrive. So we keep one
+// recognizer, only call start() after it has fully ended, and also finalize on silence.
+let recActive = false;  // recognizer is currently running (between onstart and onend)
+let doneText = {};      // per result index: the text already translated
+let lastInterim = [];   // [{i, text}] from the latest event, for the silence flush
+let silenceTimer = null;
+
+// Part of `text` not yet translated. iOS may grow one result in place (new words appended)
+// or reuse the index for a new sentence; only strip the old text when it is a real prefix.
+function untranslated(i, text) {
+  const done = doneText[i] || "";
+  const base = done.replace(/[.?!,\s]+$/, "").toLowerCase();
+  return base && text.toLowerCase().startsWith(base) ? text.slice(base.length) : text;
+}
+
+function flush(i, text) {
+  const fresh = untranslated(i, text).replace(/^[.?!,\s]+/, "").trim();
+  doneText[i] = text;
+  if (fresh) translate(fresh);
+}
+
+function flushInterim() {
+  for (const { i, text } of lastInterim) flush(i, text);
+  lastInterim = [];
+  $("interim").textContent = "";
+}
+
+function ensureRecognizer() {
+  if (recognition) return recognition;
+  recognition = new SR();
+  recognition.lang = "en-US";
+  recognition.continuous = true;
+  recognition.interimResults = true;
+
+  recognition.onstart = () => {
+    recActive = true;
+    doneText = {};
+    lastInterim = [];
+  };
+  recognition.onresult = (e) => {
+    const shown = [];
+    lastInterim = [];
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      const text = r[0].transcript;
+      if (r.isFinal) flush(i, text);
+      else {
+        lastInterim.push({ i, text });
+        shown.push(untranslated(i, text));
+      }
+    }
+    $("interim").textContent = shown.join(" ").trim();
+    clearTimeout(silenceTimer);
+    if (lastInterim.length) silenceTimer = setTimeout(flushInterim, 1500);
+  };
+  recognition.onerror = (e) => {
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      alert("마이크 또는 음성 인식 권한이 꺼져 있습니다.\n설정 > Safari > 마이크, 그리고 설정 > 일반 > 키보드에서 '받아쓰기'를 켜주세요.");
+      stop();
+    } else if (e.error !== "no-speech" && e.error !== "aborted") {
+      $("interim").textContent = "음성 인식 오류: " + e.error + " (자동으로 다시 시도합니다)";
+    }
+  };
+  recognition.onend = () => {
+    recActive = false;
+    clearTimeout(silenceTimer);
+    flushInterim();
+    // iOS ends recognition after pauses; restart while the user wants it running.
+    if (running) setTimeout(safeStart, 300);
+  };
+  return recognition;
+}
+
+function safeStart() {
+  if (!running || recActive) return; // if still ending, onend will call us again
+  try {
+    ensureRecognizer().start();
+  } catch (e) {
+    // InvalidStateError: the previous session has not fully released yet.
+    setTimeout(safeStart, 500);
+  }
+}
+
 function start() {
   if (!SR) {
     alert("이 브라우저는 음성 인식을 지원하지 않습니다. 아이폰 Safari에서 열어주세요.");
     return;
   }
   if (!store.get("apiKey")) { openSettings(); return; }
-
-  recognition = new SR();
-  recognition.lang = "en-US";
-  recognition.continuous = true;
-  recognition.interimResults = true;
-
-  recognition.onresult = (e) => {
-    let interim = "";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const r = e.results[i];
-      const t = r[0].transcript.trim();
-      if (r.isFinal) { if (t) translate(t); }
-      else interim += t + " ";
-    }
-    $("interim").textContent = interim;
-  };
-  recognition.onerror = (e) => {
-    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-      alert("마이크 또는 음성 인식 권한이 꺼져 있습니다.\n설정 > Safari > 마이크, 그리고 설정 > Siri에서 '받아쓰기'를 켜주세요.");
-      stop();
-    }
-  };
-  // iOS ends recognition after a pause; restart while the user wants it running.
-  recognition.onend = () => {
-    if (running) { try { recognition.start(); } catch {} }
-  };
-
-  try {
-    recognition.start();
-    setRunning(true);
-    keepScreenOn(true);
-  } catch (e) {
-    alert("음성 인식을 시작할 수 없습니다: " + e.message);
-  }
+  setRunning(true);
+  keepScreenOn(true);
+  // Still shutting down from the last stop: abort to hurry it; onend then restarts.
+  if (recActive) recognition.abort();
+  else safeStart();
 }
 
 function stop() {
   setRunning(false);
   keepScreenOn(false);
-  if (recognition) { recognition.onend = null; recognition.stop(); recognition = null; }
+  clearTimeout(silenceTimer);
+  if (recognition && recActive) recognition.stop(); // onend flushes the last words
 }
 
 $("toggleBtn").onclick = () => (running ? stop() : start());
