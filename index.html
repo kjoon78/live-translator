@@ -119,7 +119,7 @@ Translate the latest English utterance into natural, spoken Korean.
 The text comes from speech recognition, so it may have missing punctuation or misheard words; infer the intended meaning from context.
 Use the earlier utterances only as context. Output only the Korean translation of the latest utterance, with no notes, quotes, or romanization.`;
 
-const APP_VERSION = "v4";
+const APP_VERSION = "v5";
 const session = {
   get(k, d = "") { try { return sessionStorage.getItem(k) ?? d; } catch { return d; } },
   set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
@@ -199,7 +199,10 @@ function addItem(english) {
   el.scrollIntoView({ behavior: "smooth", block: "end" });
   return el.querySelector(".ko");
 }
-function saveLog() { session.set("log", $("log").innerHTML); }
+function saveLog() {
+  session.set("log", $("log").innerHTML);
+  session.set("history", JSON.stringify(history.slice(-4)));
+}
 $("clearBtn").onclick = () => {
   $("log").innerHTML = "";
   history.length = 0;
@@ -207,6 +210,7 @@ $("clearBtn").onclick = () => {
   dbg("clear");
 };
 if (session.get("log")) $("log").innerHTML = session.get("log");
+history.push(...JSON.parse(session.get("history", "[]")));
 
 // ---------- translation ----------
 async function translate(english) {
@@ -263,17 +267,18 @@ async function translate(english) {
 }
 
 // ---------- speech recognition ----------
-// iOS Safari's recognizer is fragile: reusing or restarting it too soon can leave it "running"
-// while it hears nothing. So every session gets a brand-new recognizer, the old one is fully
-// detached, a short gap is kept between sessions, and a watchdog reloads the page (keeping the
-// transcript) if a new session never comes alive.
+// iOS Safari bug: only the FIRST recognizer in a page load returns words. Later ones start and
+// even report audio, but never deliver results. So this page uses exactly one recognizer:
+// "중지" only pauses it (results are ignored), and whenever a fresh recognizer is needed the page
+// reloads itself (keeping the transcript) and resumes.
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const GAP_MS = 700;      // quiet time between one session ending and the next starting
-const ALIVE_MS = 3000;   // how long a new session may take to report audio
-let lastTeardown = 0;
+const ALIVE_MS = 3000;   // how long a new recognizer may take to report audio
+let recLive = false;     // the recognizer is running (between start() and onend)
+let used = false;        // this page load already created its one recognizer
+let autoStarted = false; // started by a resume after reload, without a tap
 let watchdog = null;
-let startTimer = null;
-let doneText = {};       // per result index: the text already translated
+let resultCount = 0;
+let doneText = {};       // per result index: the text already translated (or discarded)
 let lastInterim = [];    // [{i, text}] from the latest event, for the silence flush
 let silenceTimer = null;
 
@@ -307,47 +312,39 @@ function flush(i, text) {
 }
 
 function flushInterim() {
+  clearTimeout(silenceTimer);
   for (const { i, text } of lastInterim) flush(i, text);
   lastInterim = [];
   $("interim").textContent = "";
 }
 
-function teardown() {
-  clearTimeout(watchdog);
-  watchdog = null;
-  clearTimeout(silenceTimer);
-  flushInterim();
-  if (!recognition) return;
-  const old = recognition;
-  recognition = null;
-  for (const k of ["onstart", "onaudiostart", "onresult", "onerror", "onend"]) old[k] = null;
-  try { old.abort(); } catch {}
-  lastTeardown = Date.now();
+function reloadAndResume(why) {
+  dbg("reload: " + why);
+  session.set("resume", "1");
+  saveLog();
+  location.reload();
 }
 
-function alive(why) {
-  if (watchdog) { clearTimeout(watchdog); watchdog = null; dbg("alive: " + why); }
-  session.del("recovered"); // working again, so a later stall may reload once more
-}
-
-function newSession() {
-  clearTimeout(startTimer);
-  if (!running) return;
-  const wait = lastTeardown + GAP_MS - Date.now();
-  if (wait > 0) { startTimer = setTimeout(newSession, wait); return; }
-
+function createRecognizer() {
+  used = true;
   const rec = new SR();
   recognition = rec;
   rec.lang = "en-US";
   rec.continuous = true;
   rec.interimResults = true;
-  doneText = {};
-  lastInterim = [];
 
   rec.onstart = () => { dbg("onstart"); if (!("onaudiostart" in rec)) alive("start"); };
   rec.onaudiostart = () => alive("audio");
+  rec.onspeechstart = () => dbg("speech detected");
   rec.onresult = (e) => {
-    alive("result");
+    resultCount++;
+    if (resultCount === 1) dbg("first result");
+    if (!running) {
+      // Paused: remember what was heard so it is never translated later.
+      for (let i = e.resultIndex; i < e.results.length; i++) doneText[i] = e.results[i][0].transcript;
+      lastInterim = [];
+      return;
+    }
     const shown = [];
     lastInterim = [];
     for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -366,26 +363,42 @@ function newSession() {
   rec.onerror = (e) => {
     dbg("error: " + e.error);
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      if (autoStarted) {
+        // iOS refused to start without a tap after the reload; let the user tap 시작.
+        used = false;
+        setRunning(false);
+        keepScreenOn(false);
+        $("interim").textContent = "‘시작’을 눌러 계속하세요.";
+        return;
+      }
       alert("마이크 또는 음성 인식 권한이 꺼져 있습니다.\n설정 > Safari > 마이크, 그리고 설정 > 일반 > 키보드에서 '받아쓰기'를 켜주세요.");
       stop();
     }
   };
   rec.onend = () => {
-    dbg("onend");
-    teardown();
-    // iOS ends sessions after pauses; open a fresh one while the user wants it running.
-    if (running) newSession();
+    dbg(`onend (results: ${resultCount})`);
+    recLive = false;
+    clearTimeout(watchdog);
+    if (running) {
+      flushInterim();
+      reloadAndResume("recognizer ended");
+    }
   };
 
   watchdog = setTimeout(recover, ALIVE_MS);
   try {
     rec.start();
+    recLive = true;
     dbg("start()");
   } catch (e) {
     dbg("start() failed: " + e.message);
-    teardown();
-    startTimer = setTimeout(newSession, GAP_MS);
+    reloadAndResume("start failed");
   }
+}
+
+function alive(why) {
+  if (watchdog) { clearTimeout(watchdog); watchdog = null; dbg("alive: " + why); }
+  session.del("recovered"); // working again, so a later stall may reload once more
 }
 
 // The recognizer never came alive: iOS sometimes only recovers after a page reload.
@@ -398,31 +411,35 @@ function recover() {
     $("interim").textContent = "음성 인식이 응답하지 않습니다. 앱을 완전히 닫았다가 다시 열어주세요.";
     return;
   }
-  dbg("no audio in 3s -> reload");
   session.set("recovered", "1");
-  session.set("resume", "1");
-  saveLog();
-  location.reload();
+  reloadAndResume("no audio in 3s");
 }
 
-function start() {
+function start(auto = false) {
   if (!SR) {
     alert("이 브라우저는 음성 인식을 지원하지 않습니다. 아이폰 Safari에서 열어주세요.");
     return;
   }
   if (!store.get("apiKey")) { openSettings(); return; }
-  dbg("tap start");
+  autoStarted = auto;
+  dbg(auto ? "auto start" : "tap start");
+  if (recLive) {
+    // Resume the paused recognizer: only words heard from now on are translated.
+    setRunning(true);
+    keepScreenOn(true);
+    return;
+  }
+  if (used) { reloadAndResume("need a fresh recognizer"); return; }
   setRunning(true);
   keepScreenOn(true);
-  newSession();
+  createRecognizer();
 }
 
 function stop() {
-  dbg("stop");
+  dbg("pause");
+  flushInterim(); // translate the words heard right before 중지
   setRunning(false);
   keepScreenOn(false);
-  clearTimeout(startTimer);
-  teardown();
 }
 
 $("toggleBtn").onclick = () => (running ? stop() : start());
@@ -434,9 +451,9 @@ if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catc
 dbg(`loaded ${APP_VERSION}`);
 if (!store.get("apiKey")) openSettings();
 else if (session.get("resume")) {
-  // Coming back from a recovery reload: try to continue without another tap.
+  // Coming back from a reload: try to continue without another tap.
   session.del("resume");
-  start();
+  start(true);
 } else {
   session.del("recovered");
 }
